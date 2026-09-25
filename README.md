@@ -70,7 +70,7 @@ logs and replies.
 
 - No SSH, no command execution, no buttons. The worst the bot can do is read logs and post text.
 - Grafana access is a **Viewer** service account, GET requests to the Loki datasource only.
-- Log queries are capped (max 24h back, 200 lines) and labels are validated before use.
+- Log queries are capped (max 4h back, 50 lines, short outputs) and labels are validated before use.
 - Alerts and logs are treated as untrusted data (prompt injection can at most change the text
   Claude writes), and replies cannot ping `@everyone`/roles.
 - Anyone who can post in an alert channel can steer Claude's text and burn API credit. Keep those

@@ -25,13 +25,13 @@ log = logging.getLogger("alertbot")
 
 # ----------------------------------------------------------------- config ---
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 ALERT_CHANNEL_IDS = {int(x) for x in os.environ["ALERT_CHANNEL_IDS"].split(",") if x.strip()}
 GRAFANA_URL = os.environ["GRAFANA_URL"].rstrip("/")
 GRAFANA_TOKEN = os.environ["GRAFANA_TOKEN"]  # service account token, Viewer role
 LOKI_UID = os.environ["LOKI_DATASOURCE_UID"]
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "15"))
-MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "8"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "3"))
+MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "4"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 IGNORE_BOTS = os.getenv("IGNORE_BOTS", "false").lower() == "true"  # false: webhook alerts are bots
 
@@ -60,16 +60,16 @@ async def loki_labels(label: str = "") -> str:
         return "ERROR: invalid label name"
     r = await http.get(f"/label/{label}/values" if label else "/labels")
     r.raise_for_status()
-    return ", ".join(r.json()["data"][:100]) or "(none)"
+    return ", ".join(r.json()["data"][:50]) or "(none)"
 
 
 async def query_logs(logql: str, minutes: int = 60, limit: int = 100) -> str:
     now = time.time_ns()
     r = await http.get("/query_range", params={
         "query": logql,
-        "limit": min(int(limit), 200),
+        "limit": min(int(limit), 50),
         "direction": "backward",
-        "start": now - min(int(minutes), 1440) * 60 * 10**9,
+        "start": now - min(int(minutes), 240) * 60 * 10**9,
         "end": now,
     })
     r.raise_for_status()
@@ -80,8 +80,8 @@ async def query_logs(logql: str, minutes: int = 60, limit: int = 100) -> str:
         (int(ts), ",".join(f"{k}={v}" for k, v in s["stream"].items()), line)
         for s in data["result"] for ts, line in s["values"]
     )
-    out = "\n".join(f"{datetime.fromtimestamp(ts / 1e9):%m-%d %H:%M:%S} [{lbl}] {line[:400]}" for ts, lbl, line in rows)
-    return out[-8000:] or "(no log lines matched)"
+    out = "\n".join(f"{datetime.fromtimestamp(ts / 1e9):%m-%d %H:%M:%S} [{lbl}] {line[:200]}" for ts, lbl, line in rows)
+    return out[-3000:] or "(no log lines matched)"
 
 
 SYSTEM = """You are an on-call SRE assistant embedded in a Discord server. An alert was just posted.
@@ -104,8 +104,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "logql": {"type": "string", "description": "e.g. {job=\"nginx\"} |= \"error\""},
-                "minutes": {"type": "integer", "description": "How far back to look, max 1440 (default 60)"},
-                "limit": {"type": "integer", "description": "Max lines, max 200 (default 100)"},
+                "minutes": {"type": "integer", "description": "How far back to look, max 240 (default 30)"},
+                "limit": {"type": "integer", "description": "Max lines, max 50 (default 20)"},
             },
             "required": ["logql"],
         },
@@ -137,7 +137,7 @@ async def run_tool(name: str, args: dict, thread: discord.Thread) -> str:
         if name == "query_logs":
             q = args.get("logql", "")
             await thread.send(f"🔎 `{q[:200]}`")
-            return await query_logs(q, args.get("minutes", 60), args.get("limit", 100))
+            return await query_logs(q, args.get("minutes", 30), args.get("limit", 20))
         return f"ERROR: unknown tool {name}"
     except Exception as e:  # noqa: BLE001
         return f"ERROR: {e!r}"
@@ -150,7 +150,7 @@ async def analyse(alert_text: str, history: str, thread: discord.Thread) -> str:
 
     for _ in range(MAX_TOOL_TURNS):
         resp = await claude.messages.create(
-            model=CLAUDE_MODEL, max_tokens=2000, system=SYSTEM, tools=TOOLS, messages=messages
+            model=CLAUDE_MODEL, max_tokens=300, system=SYSTEM, tools=TOOLS, messages=messages
         )
         messages.append({"role": "assistant", "content": resp.content})
         final_text = [b.text for b in resp.content if b.type == "text"]
@@ -175,7 +175,7 @@ async def analyse_local(alert_text: str, history: str, thread: discord.Thread) -
 
     for _ in range(MAX_TOOL_TURNS):
         r = await llm_http.post("/chat/completions", json={
-            "model": LLM_MODEL, "messages": messages, "tools": tools, "max_tokens": 2000})
+            "model": LLM_MODEL, "messages": messages, "tools": tools, "max_tokens": 300})
         r.raise_for_status()
         msg = r.json()["choices"][0]["message"]
         messages.append(msg)
@@ -244,7 +244,7 @@ async def on_message(m: discord.Message):
             async for h in m.channel.history(limit=HISTORY_LIMIT, before=m):
                 t = flatten(h)
                 if t:
-                    hist.append(f"[{h.created_at:%Y-%m-%d %H:%M}] {t[:400]}")
+                    hist.append(f"[{h.created_at:%Y-%m-%d %H:%M}] {t[:200]}")
             try:
                 run = analyse_local if LLM_BASE_URL else analyse
                 text = await run(alert, "\n".join(reversed(hist)), thread)
