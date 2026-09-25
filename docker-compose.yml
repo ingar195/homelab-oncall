@@ -1,0 +1,10 @@
+services:
+  alertbot:
+    build: .
+    container_name: alertbot
+    restart: unless-stopped
+    env_file: .env
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
