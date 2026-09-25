@@ -169,6 +169,11 @@ def chunks(s: str, n: int = 1900):
 @bot.event
 async def on_ready():
     log.info("Logged in as %s, watching %s", bot.user, sorted(ALERT_CHANNEL_IDS))
+    for g in bot.guilds:
+        seen = {c.id for c in g.channels} & ALERT_CHANNEL_IDS
+        log.info("in server %r, can see watched channels: %s", g.name, sorted(seen) or "NONE")
+    if not bot.guilds:
+        log.warning("bot is not in any server: open the OAuth2 invite URL and authorize it")
 
 
 @bot.event
