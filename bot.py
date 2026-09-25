@@ -175,10 +175,12 @@ async def on_ready():
 async def on_message(m: discord.Message):
     if m.author.id == bot.user.id or m.channel.id not in ALERT_CHANNEL_IDS:
         return
+    log.info("message in watched channel %s from %s (bot=%s)", m.channel.id, m.author, m.author.bot)
     if IGNORE_BOTS and m.author.bot:
         return
     alert = flatten(m)
     if not alert:
+        log.warning("message has no text/embed content, ignoring (is Message Content Intent on?)")
         return
 
     async with sem:
