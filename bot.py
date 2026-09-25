@@ -9,6 +9,7 @@ Flow:
      Nothing is ever executed: no SSH, no buttons. The human runs the fix.
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -34,7 +35,17 @@ MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "8"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 IGNORE_BOTS = os.getenv("IGNORE_BOTS", "false").lower() == "true"  # false: webhook alerts are bots
 
-claude = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
+# Local model: set LLM_BASE_URL to any OpenAI-compatible server (Ollama, llama.cpp, LM Studio, vLLM).
+# Unset = Claude via ANTHROPIC_API_KEY. The model must support tool calling.
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")  # e.g. http://ollama:11434/v1
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:14b")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "none")  # most local servers ignore it
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "300"))  # local models are slow
+
+claude = None if LLM_BASE_URL else AsyncAnthropic()  # reads ANTHROPIC_API_KEY
+llm_http = httpx.AsyncClient(
+    base_url=LLM_BASE_URL, headers={"Authorization": f"Bearer {LLM_API_KEY}"}, timeout=LLM_TIMEOUT
+)
 # GET-only through Grafana's datasource proxy; the Viewer token cannot change anything.
 http = httpx.AsyncClient(
     base_url=f"{GRAFANA_URL}/api/datasources/proxy/uid/{LOKI_UID}/loki/api/v1",
@@ -115,11 +126,26 @@ def flatten(m: discord.Message) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
+def user_prompt(alert_text: str, history: str) -> str:
+    return f"NEW ALERT:\n{alert_text}\n\nRECENT MESSAGES IN THIS CHANNEL (oldest first):\n{history or '(none)'}"
+
+
+async def run_tool(name: str, args: dict, thread: discord.Thread) -> str:
+    try:
+        if name == "loki_labels":
+            return await loki_labels(args.get("label", ""))
+        if name == "query_logs":
+            q = args.get("logql", "")
+            await thread.send(f"🔎 `{q[:200]}`")
+            return await query_logs(q, args.get("minutes", 60), args.get("limit", 100))
+        return f"ERROR: unknown tool {name}"
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR: {e!r}"
+
+
 async def analyse(alert_text: str, history: str, thread: discord.Thread) -> str:
-    messages = [{
-        "role": "user",
-        "content": f"NEW ALERT:\n{alert_text}\n\nRECENT MESSAGES IN THIS CHANNEL (oldest first):\n{history or '(none)'}",
-    }]
+    """Claude via the Anthropic API."""
+    messages = [{"role": "user", "content": user_prompt(alert_text, history)}]
     final_text: list[str] = []
 
     for _ in range(MAX_TOOL_TURNS):
@@ -131,25 +157,41 @@ async def analyse(alert_text: str, history: str, thread: discord.Thread) -> str:
         if resp.stop_reason != "tool_use":
             break
 
-        results = []
-        for b in resp.content:
-            if b.type != "tool_use":
-                continue
-            try:
-                if b.name == "loki_labels":
-                    out = await loki_labels(b.input.get("label", ""))
-                elif b.name == "query_logs":
-                    q = b.input.get("logql", "")
-                    await thread.send(f"🔎 `{q[:200]}`")
-                    out = await query_logs(q, b.input.get("minutes", 60), b.input.get("limit", 100))
-                else:
-                    out = f"ERROR: unknown tool {b.name}"
-            except Exception as e:  # noqa: BLE001
-                out = f"ERROR: {e!r}"
-            results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+        results = [
+            {"type": "tool_result", "tool_use_id": b.id, "content": await run_tool(b.name, b.input, thread)}
+            for b in resp.content if b.type == "tool_use"
+        ]
         messages.append({"role": "user", "content": results})
 
     return "\n".join(final_text).strip() or "I could not reach a conclusion."
+
+
+async def analyse_local(alert_text: str, history: str, thread: discord.Thread) -> str:
+    """Local model via an OpenAI-compatible /chat/completions endpoint."""
+    tools = [{"type": "function", "function": {
+        "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in TOOLS]
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user_prompt(alert_text, history)}]
+    text = ""
+
+    for _ in range(MAX_TOOL_TURNS):
+        r = await llm_http.post("/chat/completions", json={
+            "model": LLM_MODEL, "messages": messages, "tools": tools, "max_tokens": 2000})
+        r.raise_for_status()
+        msg = r.json()["choices"][0]["message"]
+        messages.append(msg)
+        text = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S)  # reasoning models
+        if not msg.get("tool_calls"):
+            break
+
+        for c in msg["tool_calls"]:
+            args = c["function"].get("arguments") or "{}"
+            try:
+                args = json.loads(args) if isinstance(args, str) else args
+            except ValueError:
+                args = {}
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": await run_tool(c["function"]["name"], args, thread)})
+
+    return text.strip() or "I could not reach a conclusion."
 
 
 # ------------------------------------------------------------ Discord -------
@@ -204,7 +246,8 @@ async def on_message(m: discord.Message):
                 if t:
                     hist.append(f"[{h.created_at:%Y-%m-%d %H:%M}] {t[:400]}")
             try:
-                text = await analyse(alert, "\n".join(reversed(hist)), thread)
+                run = analyse_local if LLM_BASE_URL else analyse
+                text = await run(alert, "\n".join(reversed(hist)), thread)
             except Exception as e:  # noqa: BLE001
                 log.exception("analysis failed")
                 await thread.send(f"⚠️ Analysis failed: `{e!r}`")

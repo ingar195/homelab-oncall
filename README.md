@@ -43,6 +43,18 @@ https://console.anthropic.com -> **Settings -> API Keys** -> Create Key (starts 
 once) -> `ANTHROPIC_API_KEY`. The API needs credit (Settings -> Billing); a Claude.ai subscription does
 not cover it. Set a monthly spend limit under Settings -> Limits.
 
+### 3b. Or use a local model instead of Claude
+
+Set `LLM_BASE_URL` (and `LLM_MODEL`) in `.env`; then no Anthropic key is needed and nothing leaves
+your network. Any OpenAI-compatible server works (Ollama, llama.cpp, LM Studio, vLLM), e.g. Ollama:
+```
+LLM_BASE_URL=http://<ollama-host>:11434/v1
+LLM_MODEL=qwen2.5:14b
+```
+The model must support **tool calling**, or the bot can't query Loki. Small models (under ~7B) are
+unreliable at this; try qwen2.5 14B, llama3.1 8B+ or similar. Replies are slower (up to `LLM_TIMEOUT`,
+default 300s), and if the server runs on the Docker host use its IP, not `localhost`.
+
 ### 4. Run it
 
 On the home server (it must be able to reach `GRAFANA_URL`), fill in `.env` with no quotes around values:
